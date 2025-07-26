@@ -2,6 +2,11 @@ use std::net::SocketAddr;
 use std::thread;
 use std::os::unix::io::RawFd;
 use std::mem;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+static CONNECTIONS: AtomicU64 = AtomicU64::new(0);
+static BYTES_SENT: AtomicU64 = AtomicU64::new(0);
 
 struct RawTcpStream {
     fd: RawFd,
@@ -149,13 +154,39 @@ impl Drop for CustomTcpListener {
     }
 }
 
+fn get_rusage() -> (u64, u64) {
+    let mut rusage: libc::rusage = unsafe { mem::zeroed() };
+    unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut rusage) };
+    
+    let user_time = (rusage.ru_utime.tv_sec as u64 * 1000000) + rusage.ru_utime.tv_usec as u64;
+    let sys_time = (rusage.ru_stime.tv_sec as u64 * 1000000) + rusage.ru_stime.tv_usec as u64;
+    (user_time, sys_time)
+}
+
+fn print_stats() {
+    let (user_us, sys_us) = get_rusage();
+    let conn = CONNECTIONS.load(Ordering::Relaxed);
+    let bytes = BYTES_SENT.load(Ordering::Relaxed);
+    
+    println!("Connections: {} | Bytes sent: {} | CPU: {:.2}ms user, {:.2}ms sys", 
+             conn, bytes, user_us as f64 / 1000.0, sys_us as f64 / 1000.0);
+}
+
 fn main() {
     let listener = CustomTcpListener::bind("127.0.0.1:8080").unwrap();
-    println!("Custom TCP Server running on http://127.0.0.1:8080");
+    println!("Server running on http://127.0.0.1:8080");
+
+    thread::spawn(|| {
+        loop {
+            thread::sleep(std::time::Duration::from_secs(5));
+            print_stats();
+        }
+    });
 
     loop {
         match listener.accept() {
             Ok(stream) => {
+                CONNECTIONS.fetch_add(1, Ordering::Relaxed);
                 thread::spawn(|| {
                     handle_connection(stream);
                 });
@@ -226,8 +257,8 @@ fn send_ok_response(stream: &mut RawTcpStream) {
         html_body
     );
 
-    if let Err(e) = stream.write_all(response.as_bytes()) {
-        eprintln!("Error writing response: {}", e);
+    if let Ok(_) = stream.write_all(response.as_bytes()) {
+        BYTES_SENT.fetch_add(response.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -248,7 +279,7 @@ fn send_bad_request_response(stream: &mut RawTcpStream) {
         html_body
     );
 
-    if let Err(e) = stream.write_all(response.as_bytes()) {
-        eprintln!("Error writing bad request response: {}", e);
+    if let Ok(_) = stream.write_all(response.as_bytes()) {
+        BYTES_SENT.fetch_add(response.len() as u64, Ordering::Relaxed);
     }
 }
